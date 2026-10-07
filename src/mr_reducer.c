@@ -1,3 +1,27 @@
+/*
+ * mr_reducer.c - Processo reducer del framework libmr.
+ *
+ * Il processo reducer e' un figlio creato con fork(): riceve su stdin le
+ * coppie <token, processed_token> prodotte dal mapper, le raggruppa per
+ * token e invoca la funzione reducer dell'utente una sola volta per ogni
+ * token distinto, scrivendo i risultati finali su stdout verso il processo
+ * principale.
+ *
+ * Organizzazione interna (Sezioni 6.2, 8 e Addendum della specifica):
+ *   - FASE 1: lettura sequenziale delle coppie da stdin e inserimento in
+ *     una tabella hash a bucket, con lista di valori per ogni token. La
+ *     tabella e' locale al processo e non e' condivisa: non servono
+ *     mutex perche' e' usata solo dal thread di raggruppamento;
+ *   - FASE 2: partizionamento deterministico dei gruppi completi verso
+ *     reducer_threads code, usando la funzione di hashing configurata
+ *     (o quella di default) e il modulo sul numero di worker;
+ *   - FASE 3: un thread C11 per worker, ciascuno responsabile dei token
+ *     che gli sono stati assegnati, con scrittura su stdout serializzata
+ *     da un mutex condiviso.
+ *
+ * I valori intermedi e i risultati sono sempre trattati come sequenze
+ * opache di byte: nessuna funzione di stringa viene applicata su di essi.
+ */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -14,13 +38,27 @@
 #include <unistd.h>
 #include <threads.h>
 
+/* Numero di bucket della tabella hash usata per il raggruppamento. */
 #define HASH_TABLE_BUCKETS 8192
 
+/*
+ * Valore opaco memorizzato per un token: puntatore ai byte e lunghezza.
+ * Nessun byte viene interpretato, puo' contenere anche byte nulli.
+ */
 typedef struct {
     void *data;
     size_t size;
 } stored_value_t;
 
+/*
+ * Gruppo associato a un token distinto: la chiave come stringa C (con
+ * terminatore aggiunto localmente), l'elenco dei valori prodotti dal
+ * mapper per quel token e il puntatore al gruppo successivo nella stessa
+ * catena di bucket.
+ *
+ * L'array dei valori cresce con raddoppio della capacita' ogni volta che
+ * si esaurisce lo spazio disponibile.
+ */
 typedef struct token_group {
     char *token;
     size_t token_len;
@@ -30,11 +68,20 @@ typedef struct token_group {
     struct token_group *next;
 } token_group_t;
 
+/*
+ * Tabella hash per il raggruppamento per token: array di bucket, ciascuno
+ * intestato a una lista di gruppi, più il contatore dei token distinti
+ * incontrati (usato nelle statistiche di esecuzione).
+ */
 typedef struct {
     token_group_t *buckets[HASH_TABLE_BUCKETS];
     size_t distinct_tokens;
 } group_table_t;
 
+/*
+ * Contesto di un worker reducer: coda dei gruppi assegnatigli, callback
+ * utente e strumenti per la scrittura sincronizzata su stdout.
+ */
 typedef struct {
     int worker_id;
     mr_queue_t *queue;
@@ -47,6 +94,11 @@ typedef struct {
     mr_logger_t *logger;
 } reducer_worker_arg_t;
 
+/*
+ * Contesto passato come emit_arg alla funzione reducer utente. Il campo
+ * expected_token permette di verificare che il risultato emesso sia
+ * associato al token effettivamente ricevuto dalla callback.
+ */
 typedef struct {
     const char *expected_token;
     int out_fd;
@@ -56,6 +108,16 @@ typedef struct {
     mr_logger_t *logger;
 } reducer_emit_ctx_t;
 
+/*
+ * internal_hash - Hash dei token per la scelta del bucket della tabella.
+ *
+ * Variante DJB2 interna, con modulo sul numero di bucket: serve soltanto a
+ * distribuire i token fra i bucket e non e' la funzione usata per il
+ * partizionamento fra i thread worker, che dipende invece dalla funzione
+ * configurabile dall'utente (mr_attr_set_hash_function).
+ *
+ * Ritorna l'indice del bucket associato al token.
+ */
 static size_t internal_hash(const char *str, size_t len) {
     size_t h = 5381;
     for (size_t i = 0; i < len; i++) {
@@ -64,6 +126,23 @@ static size_t internal_hash(const char *str, size_t len) {
     return h % HASH_TABLE_BUCKETS;
 }
 
+/*
+ * table_find_or_create - Ricerca del gruppo associato a un token, con
+ * creazione se non esiste ancora.
+ *
+ * Scorre la catena di bucket cercando un token identico per lunghezza e
+ * contenuto; se non lo trova, alloca un nuovo gruppo, lo inserisce in
+ * testa al bucket (cosi' l'inserimento e' O(1)) e incrementa il contatore
+ * dei token distinti. Il token viene copiato con strdup, dato che il
+ * buffer ricevuto dalla pipe viene liberato subito dopo la chiamata.
+ *
+ * table     : tabella di raggruppamento.
+ * token     : token ricevuto, stringa C terminata da '\0'.
+ * token_len : lunghezza del token in byte.
+ *
+ * Ritorna il gruppo esistente o quello appena creato, oppure NULL se
+ * l'allocazione fallisce.
+ */
 static token_group_t *table_find_or_create(group_table_t *table, const char *token, size_t token_len) {
     size_t b = internal_hash(token, token_len);
     token_group_t *curr = table->buckets[b];
@@ -103,6 +182,22 @@ static token_group_t *table_find_or_create(group_table_t *table, const char *tok
     return new_grp;
 }
 
+/*
+ * table_add_value - Aggiunta di un valore opaco al gruppo di un token.
+ *
+ * Se l'array di valori e' pieno viene raddoppiata la capacita' con realloc.
+ * I byte del valore vengono copiati byte per byte nel buffer del gruppo,
+ * perche' il buffer di lettura della pipe viene riutilizzato: e' questa
+ * copia a garantire che i dati restino validi fino all'invocazione della
+ * funzione reducer. La copia avviene con un ciclo esplicito, senza
+ * funzioni di stringa, per non dare alcuna ipotesi sul contenuto.
+ *
+ * grp      : gruppo destinatario.
+ * val      : valore da copiare; NULL se val_size vale 0.
+ * val_size : numero di byte del valore.
+ *
+ * Ritorna 0 in caso di successo, -1 se fallisce l'allocazione.
+ */
 static int table_add_value(token_group_t *grp, const void *val, size_t val_size) {
     if (grp->values_count == grp->values_capacity) {
         size_t new_cap = grp->values_capacity * 2;
@@ -134,6 +229,30 @@ static int table_add_value(token_group_t *grp, const void *val, size_t val_size)
     return 0;
 }
 
+/*
+ * reducer_emit_callback - Implementazione di mr_emit_result_t fornita dal
+ * framework al reducer utente.
+ *
+ * Valida il token emesso, verifica che coincida con quello del gruppo
+ * elaborato e scrive il record sulla pipe verso il processo principale
+ * nel formato della Sezione 7:
+ *
+ *     [ token_len | result_len ] [ token_len byte di token ] [ result_len byte ]
+ *
+ * I byte del risultato vengono trasferiti senza interpretarli: il
+ * framework non richiede che siano una stringa C ne' che contengano un
+ * terminatore '\0'. Scrivendo subito i dati sulla pipe, il framework
+ * rispetta il requisito di copiare il risultato prima della restituzione
+ * del controllo all'utente.
+ *
+ * token      : token associato al risultato.
+ * result     : risultato opaco; puo' essere NULL se result_size vale 0.
+ * result_size: lunghezza in byte del risultato.
+ * emit_arg   : puntatore a reducer_emit_ctx_t.
+ *
+ * Ritorna 0 se il record e' stato scritto, -1 in caso di parametri non
+ * conformi al contratto o di errore di scrittura.
+ */
 static int reducer_emit_callback(const char *token, const void *result, size_t result_size, void *emit_arg) {
     if (token == NULL || emit_arg == NULL) {
         return -1;
@@ -193,6 +312,22 @@ static int reducer_emit_callback(const char *token, const void *result, size_t r
     return 0;
 }
 
+/*
+ * reducer_worker_main - Thread C11 worker del processo reducer.
+ *
+ * Estrae dalla propria coda i gruppi <token, processed_token[]> assegnatigli
+ * e invoca la funzione reducer dell'utente UNA SOLTA volta per ciascun
+ * token distinto, passandogli tutti i valori associati. Non e' corretto
+ * invocare il reducer una volta per ogni singola coppia.
+ *
+ * Dopo la chiamata il worker libera l'array dei valori, i buffer dei
+ * valori stessi, il token e il gruppo, che non sono piu' necessari in
+ * quanto il raggruppamento e' ormai completo.
+ *
+ * arg : puntatore a reducer_worker_arg_t.
+ *
+ * Ritorna 0 al termine dell'elaborazione.
+ */
 static int reducer_worker_main(void *arg) {
     reducer_worker_arg_t *w_arg = (reducer_worker_arg_t *)arg;
     char thrd_name[32];
@@ -243,6 +378,25 @@ static int reducer_worker_main(void *arg) {
     return 0;
 }
 
+/*
+ * reducer_process_main - Corpo del processo reducer (non fa parte
+ * dell'interfaccia pubblica).
+ *
+ * Viene eseguito nel processo figlio creato con fork(), dopo che stdin e'
+ * stato collegato con dup2() alla pipe del mapper e stdout alla pipe verso
+ * il processo principale. Le tre fasi sono descritte nei commenti interni.
+ *
+ * queue_size      : capacita' delle code interne dei worker.
+ * reducer_threads : numero di thread worker (almeno 1).
+ * reducer_cb      : funzione reducer fornita dal programma utente.
+ * user_arg        : argomento utente passato invariato a reducer_cb.
+ * hash_func       : funzione di hashing per il partizionamento dei token
+ *                   fra i worker; se NULL viene usata mr_default_hash.
+ * hash_arg        : argomento passato a hash_func.
+ * logger          : struttura del log di esecuzione.
+ *
+ * Ritorna 0 in caso di successo, -1 in caso di errore.
+ */
 int reducer_process_main(
     size_t queue_size,
     size_t reducer_threads,

@@ -28,9 +28,11 @@ Implementazione completa del framework C concorrente `libmr` (Progetto di Labora
 - [x] Rimozione totale di qualsiasi assegnamento manuale a `errno` in favore del semplice ritorno di `-1` in caso di errore.
 - [x] Aggiunta di test intensivi su larga scala: stress test con 100.000 token e 8 thread concorrenti, alta cardinalità con 3.000 token unici distinti, e streaming con righe giganti (>64KB).
 - [x] Compilazione con successo dell'intera libreria statica `libmr.a`, degli esempi e superamento al 100% dell'intera suite di test automatizzata (inclusi i test su larga scala).
+- [x] Documentazione di tutte le funzioni nei file `.c` (requisito "codice commentato in modo adeguato" della Sezione 17 di `Testo.pdf`): intestazione di file, commenti di funzione con scopo/parametri/valore di ritorno e commenti alle strutture dati, in `src/mr_api.c`, `src/mr_common.c`, `src/mr_queue.c`, `src/mr_mapper.c`, `src/mr_reducer.c`, `examples/word_count.c`, `examples/dump_output.c`, `tests/test_suite.c`.
 
 ## 3. Stato Corrente (Cosa si sta facendo)
 - Implementazione completata, semplificata secondo lo standard universitario triennale e testata con successo.
+- Documentazione delle funzioni completata in tutti i file `.c`; build con `-Wall -Wextra -Werror -pedantic` pulita e `make test` al 100%.
 - Progetto pronto per la consegna o per ulteriori verifiche / redazione della relazione tecnica finale.
 
 ## 4. Prossimi Passi

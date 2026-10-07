@@ -1,3 +1,15 @@
+/*
+ * dump_output.c - Utility ausiliaria per ispezionare in forma leggibile il
+ * file di output prodotto dal framework.
+ *
+ * Il file di output e' binario, a record con lunghezze esplicite: ogni
+ * record e' composto da un header (token_len, result_len), dai byte del
+ * token e dai byte del risultato. Questo programma lo decodifica e lo
+ * stampa a terminale; non fa parte della libreria e serve solo a
+ * verificare a mano il contenuto dell'output.
+ *
+ * Uso: dump_output <file_output.mro>
+ */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -13,11 +25,24 @@
 
 #include "mr.h"
 
+/* Header di un record del file di output, replicato dal formato prodotto dal framework. */
 typedef struct {
     int token_len;
     int result_len;
 } output_record_hdr_t;
 
+/*
+ * safe_readn - Lettura completa di n byte, con gestione delle letture
+ * parziali (un record puo' essere maggiore della dimensione del buffer
+ * interno della pipe o del file).
+ *
+ * fd  : file descriptor da cui leggere.
+ * buf : buffer di destinazione.
+ * n   : numero di byte da leggere.
+ *
+ * Ritorna n se sono stati letti tutti i byte, 0 per EOF pulito prima di
+ * iniziare e -1 per errore o EOF prematuro.
+ */
 static ssize_t safe_readn(int fd, void *buf, size_t n) {
     size_t nleft = n;
     char *ptr = (char *)buf;
@@ -35,6 +60,18 @@ static ssize_t safe_readn(int fd, void *buf, size_t n) {
     return (ssize_t)n;
 }
 
+/*
+ * main - Lettura sequenziale dei record del file di output e stampa.
+ *
+ * Per ogni record viene stampato il token e, quando il risultato e'
+ * lungo esattamente sizeof(int), il suo valore come intero; in caso
+ * contrario viene indicata soltanto la dimensione, dato che il risultato
+ * e' un dato opaco che non e' detto essere una stringa.
+ *
+ * argv[1] : percorso del file di output da ispezionare.
+ *
+ * Ritorna 0 in caso di successo, 1 in caso di errore.
+ */
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Uso: %s <file_output.mro>\n", argv[0]);

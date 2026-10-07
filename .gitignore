@@ -1,0 +1,16 @@
+# Artefatti di compilazione
+obj/
+*.o
+*.a
+
+# Eseguibili
+examples/word_count
+examples/dump_output
+tests/test_suite
+
+# Output delle elaborazioni e log
+*.mro
+*.mro.stats
+*.mro.stats.mapper
+*.mro.stats.reducer
+*.log

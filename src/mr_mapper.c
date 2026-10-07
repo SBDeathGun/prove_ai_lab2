@@ -1,3 +1,25 @@
+/*
+ * mr_mapper.c - Processo mapper del framework libmr.
+ *
+ * Il processo mapper e' un figlio creato con fork() dal processo
+ * principale: riceve su stdin le righe logiche serializzate e scrive su
+ * stdout le coppie <token, processed_token> serializzate verso il reducer.
+ *
+ * Organizzazione interna (Sezione 6.1 della specifica):
+ *   - un thread reader (reader_main) legge i messaggi da stdin e li
+ *     inserisce in una coda produttore-consumatore;
+ *   - N thread worker (mapper_worker_main) estraggono le righe dalla coda
+ *     e invocano la funzione mapper fornita dal programma utente;
+ *   - la scrittura delle coppie su stdout e' serializzata con un mutex
+ *     dedicato, in modo che un messaggio logico non venga mai mescolato
+ *     con un messaggio prodotto da un altro thread;
+ *   - la pipe verso il reducer viene chiusa dal solo codice di
+ *     coordinamento del processo, dopo la terminazione di TUTTI i thread
+ *     mapper: e' questo il segnale di EOF per il reducer (Sezione 5.1).
+ *
+ * Lo stdout del processo e' riservato al protocollo interno: le funzioni
+ * applicative non devono scrivervi direttamente.
+ */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -14,6 +36,11 @@
 #include <unistd.h>
 #include <threads.h>
 
+/*
+ * Task di lavoro: una riga logica deserializzata, pronta per essere
+ * passata al mapper utente. I buffer sono di proprieta' del task e vengono
+ * liberati dal worker al termine dell'elaborazione.
+ */
 typedef struct {
     char *file_name;
     size_t file_name_len;
@@ -22,12 +49,18 @@ typedef struct {
     size_t line_len;
 } mapper_task_t;
 
+/* Contesto del thread lettore: coda di destinazione e logger condiviso. */
 typedef struct {
     mr_queue_t *queue;
     mr_logger_t *logger;
     size_t lines_count;
 } reader_arg_t;
 
+/*
+ * Contesto di un worker mapper: riceve dalla coda le righe, invoca la
+ * callback utente e fornisce alla funzione di emissione il contesto
+ * necessario per scrivere sulla pipe verso il reducer.
+ */
 typedef struct {
     int worker_id;
     mr_queue_t *queue;
@@ -40,6 +73,11 @@ typedef struct {
     mr_logger_t *logger;
 } worker_arg_t;
 
+/*
+ * Contesto passato come emit_arg alla funzione mapper utente: consente a
+ * mapper_emit_callback di serializzare e scrivere la coppia emessa,
+ * aggiornando in modo sincronizzato il contatore delle coppie prodotte.
+ */
 typedef struct {
     int out_fd;
     mtx_t *out_mtx;
@@ -48,6 +86,32 @@ typedef struct {
     mr_logger_t *logger;
 } emit_ctx_t;
 
+/*
+ * mapper_emit_callback - Implementazione di mr_emit_pair_t fornita dal
+ * framework al mapper utente.
+ *
+ * Riceve la coppia <token, valore>, ne valida la forma e la scrive sulla
+ * pipe verso il reducer nel formato della Sezione 7:
+ *
+ *     [ token_len | value_len ] [ token_len byte di token ] [ value_len byte ]
+ *
+ * Il contratto e' che i dati passati dal programma utente vengano copiati
+ * prima della restituzione del controllo: qui la copia e' effettuata dal
+ * semplice fatto che i byte vengono trasferiti sulla pipe, per cui il
+ * chiamante puo' riutilizzare o liberare subito i propri buffer.
+ *
+ * Il valore e' trattato come sequenza opaca di byte: non viene applicata
+ * alcuna funzione di stringa e non si assume la presenza di un
+ * terminatore '\0'.
+ *
+ * token      : token, stringa C alfanumerica ASCII.
+ * value      : valore opaco; puo' essere NULL se value_size vale 0.
+ * value_size : lunghezza in byte del valore.
+ * emit_arg   : puntatore a emit_ctx_t.
+ *
+ * Ritorna 0 se la coppia e' stata scritta, -1 se i parametri non sono
+ * conformi al contratto o se la scrittura fallisce.
+ */
 static int mapper_emit_callback(const char *token, const void *value, size_t value_size, void *emit_arg) {
     if (token == NULL || emit_arg == NULL) {
         return -1;
@@ -102,6 +166,29 @@ static int mapper_emit_callback(const char *token, const void *value, size_t val
     return 0;
 }
 
+/*
+ * reader_main - Thread C11 lettore del processo mapper (firma thrd_start_t).
+ *
+ * Legge da stdin i messaggi "riga logica" prodotti dal processo
+ * principale, li deserializza e li affida alla coda dei worker.
+ *
+ * Protocollo atteso su stdin (Sezione 7):
+ *     [ file_name_len | line_len | line_number ] [ nome file ] [ riga ]
+ *
+ * Le lunghezze ricevute sono controllate prima dell'uso: un valore
+ * negativo o superiore ai limiti documentati (MR_MAX_PATH_LEN,
+ * MR_MAX_LINE_LEN) rende il messaggio non valido e interrompe la
+ * lettura, evitando allocazioni enormi o conversioni errate a size_t.
+ *
+ * La chiusura della pipe da parte del processo principale provoca la
+ * ricezione di EOF: il thread chiama allora mr_queue_close(), cosi' i
+ * worker elaborano le righe gia' in coda e terminano.
+ *
+ * arg : puntatore a reader_arg_t.
+ *
+ * Ritorna 0 al termine (anche in caso di errore di lettura, che viene
+ * prima registrato nel log).
+ */
 static int reader_main(void *arg) {
     reader_arg_t *r_arg = (reader_arg_t *)arg;
     mr_log_msg(r_arg->logger, "mapper", "reader", "AVVIO_THREAD", "Avviato thread reader mapper");
@@ -176,6 +263,19 @@ static int reader_main(void *arg) {
     return 0;
 }
 
+/*
+ * mapper_worker_main - Thread C11 worker del processo mapper.
+ *
+ * Estrae righe dalla coda finche' non riceve l'indicazione di coda
+ * chiusa, ricostruisce per ogni riga una struttura mr_file_line_t valida
+ * nel proprio spazio di indirizzamento e invoca la funzione mapper
+ * dell'utente. Nessun worker chiude la pipe verso il reducer: la
+ * chiusura e' compito del solo thread di coordinamento del processo.
+ *
+ * arg : puntatore a worker_arg_t.
+ *
+ * Ritorna 0 al termine dell'elaborazione.
+ */
 static int mapper_worker_main(void *arg) {
     worker_arg_t *w_arg = (worker_arg_t *)arg;
     char thrd_name[32];
@@ -214,6 +314,34 @@ static int mapper_worker_main(void *arg) {
     return 0;
 }
 
+/*
+ * mapper_process_main - Corpo del processo mapper (non fa parte
+ * dell'interfaccia pubblica).
+ *
+ * Viene eseguito nel processo figlio creato con fork(), dopo che
+ * stdin e' stato collegato con dup2() alla pipe del processo principale e
+ * stdout alla pipe verso il reducer. Sequenza:
+ *
+ *   1. crea la coda produttore-consumatore e i mutex di uscita e di
+ *      statistiche;
+ *   2. avvia un thread reader e mapper_threads thread worker C11;
+ *   3. attende la terminazione del reader e poi di tutti i worker;
+ *   4. chiude stdout (pipe verso il reducer), segnalando al reducer che
+ *      non arriveranno piu' coppie;
+ *   5. libera le risorse locali e termina.
+ *
+ * In caso di errore in una fase di avvio, le risorse gia' acquisite
+ * vengono rilasciate e la coda viene chiusa per sbloccare e joinare i
+ * thread gia' partiti.
+ *
+ * queue_size     : capacita' della coda interna.
+ * mapper_threads : numero di thread worker (almeno 1).
+ * mapper_cb      : funzione mapper fornita dal programma utente.
+ * user_arg       : argomento utente passato invariato a mapper_cb.
+ * logger         : struttura del log di esecuzione.
+ *
+ * Ritorna 0 in caso di successo, -1 in caso di errore.
+ */
 int mapper_process_main(
     size_t queue_size,
     size_t mapper_threads,

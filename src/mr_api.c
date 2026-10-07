@@ -1,3 +1,26 @@
+/*
+ * mr_api.c - Interfaccia pubblica del framework libmr e orchestrazione
+ * della pipeline.
+ *
+ * Contiene l'implementazione delle funzioni esposte in mr.h
+ * (mr_attr_*, mr_create, mr_start, mr_destroy) e la logica che, nel
+ * processo principale, crea i processi figli e trasporta i dati.
+ *
+ * La pipeline e' composta da tre processi e tre pipe anonime:
+ *
+ *   Processo principale --(main_to_mapper)--> Mapper
+ *   Mapper              --(mapper_to_reducer)--> Reducer
+ *   Reducer             --(reducer_to_main)--> Processo principale
+ *
+ * La funzione mr_start() e' bloccante: crea le pipe, esegue i due fork(),
+ * collega stdin e stdout dei figli con dup2(), chiude in ogni processo i
+ * descrittori non utilizzati (condizione essenziale per la propagazione
+ * dell'EOF), invia le righe, raccoglie i risultati, scrive il file di
+ * output e attende i figli con waitpid().
+ *
+ * Non viene usato exec(): i figli ereditano il codice del processo
+ * chiamante e con esso i puntatori alle funzioni mapper e reducer.
+ */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -22,6 +45,22 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+/*
+ * Definizione della struttura opaca mr_t: il programma utente non ne
+ * conosce i campi, ma vede solo il puntatore mr_t.
+ *
+ *   attr    : copia degli attributi di configurazione effettuata da
+ *             mr_create(); il chiamante puo' quindi distruggere o
+ *             modificare il proprio mr_attr_t senza effetti;
+ *   mapper  : puntatore alla funzione mapper dell'utente, ereditato dai
+ *             processi figli tramite fork();
+ *   reducer : puntatore alla funzione reducer dell'utente;
+ *   user_arg: argomento utente, inoltrato invariato alle due callback.
+ *
+ * Non esistono variabili globali o statiche condivise: piu' istanze mr_t
+ * sono quindi utilizzabili contemporaneamente nello stesso processo senza
+ * interferenze (requisito dell'addendum).
+ */
 struct mr {
     mr_attr_t attr;
     mr_mapper_t mapper;
@@ -29,6 +68,13 @@ struct mr {
     void *user_arg;
 };
 
+/*
+ * Risultato finale in memoria, in attesa di essere ordinato e scritto nel
+ * file di output. arrival_order conserva l'ordine di arrivo sulla pipe,
+ * usato come criterio di paragone secondario in caso di piu' risultati per
+ * lo stesso token, cosi' da rendere l'output completamente deterministico
+ * (Sezione 8).
+ */
 typedef struct {
     char *token;
     size_t token_len;
@@ -37,6 +83,18 @@ typedef struct {
     size_t arrival_order;
 } final_result_item_t;
 
+/*
+ * mr_attr_init - Inizializzazione degli attributi con valori di default.
+ *
+ * I default scelti sono 2 thread mapper, 2 thread reducer, code da 64
+ * elementi, file di log predefinito (mr.log) e funzione di hashing di
+ * default. I numeri di thread e la dimensione delle code sono sempre >= 1,
+ * come richiesto dal contratto pubblico.
+ *
+ * attr : puntatore alla struttura da inizializzare.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL.
+ */
 int mr_attr_init(mr_attr_t *attr) {
     if (attr == NULL) {
         return -1;
@@ -50,6 +108,18 @@ int mr_attr_init(mr_attr_t *attr) {
     return 0;
 }
 
+/*
+ * mr_attr_destroy - Distruzione degli attributi.
+ *
+ * Riporta tutti i campi al loro stato neutro. Non effettua deallocazioni,
+ * perche' gli attributi non possiedono risorse proprie: log_file e hash_arg
+ * sono puntatori di proprieta' del chiamante e vengono semplicemente
+ * azzerati.
+ *
+ * attr : struttura da distruggere.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL.
+ */
 int mr_attr_destroy(mr_attr_t *attr) {
     if (attr == NULL) {
         return -1;
@@ -63,6 +133,15 @@ int mr_attr_destroy(mr_attr_t *attr) {
     return 0;
 }
 
+/*
+ * mr_attr_set_mapper_threads - Impostazione del numero di thread mapper.
+ *
+ * attr : attributi da modificare.
+ * n    : numero di thread; 0 e' rifiutato perche' il processo mapper deve
+ *        essere multithread.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL o n vale 0.
+ */
 int mr_attr_set_mapper_threads(mr_attr_t *attr, size_t n) {
     if (attr == NULL || n == 0) {
         return -1;
@@ -71,6 +150,15 @@ int mr_attr_set_mapper_threads(mr_attr_t *attr, size_t n) {
     return 0;
 }
 
+/*
+ * mr_attr_set_reducer_threads - Impostazione del numero di thread reducer.
+ *
+ * attr : attributi da modificare.
+ * n    : numero di thread; 0 e' rifiutato perche' il processo reducer deve
+ *        essere multithread.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL o n vale 0.
+ */
 int mr_attr_set_reducer_threads(mr_attr_t *attr, size_t n) {
     if (attr == NULL || n == 0) {
         return -1;
@@ -79,6 +167,19 @@ int mr_attr_set_reducer_threads(mr_attr_t *attr, size_t n) {
     return 0;
 }
 
+/*
+ * mr_attr_set_queue_size - Impostazione della capacita' delle code interne.
+ *
+ * Il valore riguarda soltanto le code usate dal framework per coordinare i
+ * thread C11 nei processi mapper e reducer: non ha alcun effetto sulla
+ * dimensione delle pipe del sistema operativo. Uno zero non e' valido,
+ * perche' una coda di capacita' nulla bloccherebbe i produttori.
+ *
+ * attr : attributi da modificare.
+ * n    : capacita' massima in numero di elementi.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL o n vale 0.
+ */
 int mr_attr_set_queue_size(mr_attr_t *attr, size_t n) {
     if (attr == NULL || n == 0) {
         return -1;
@@ -87,6 +188,18 @@ int mr_attr_set_queue_size(mr_attr_t *attr, size_t n) {
     return 0;
 }
 
+/*
+ * mr_attr_set_log_file - Impostazione del percorso del file di log.
+ *
+ * Il puntatore viene memorizzato, non copiato: deve quindi restare valido
+ * per tutta la durata dell'elaborazione. NULL (o una stringa vuota)
+ * significa usare il nome predefinito "mr.log".
+ *
+ * attr : attributi da modificare.
+ * path : percorso del file di log.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL.
+ */
 int mr_attr_set_log_file(mr_attr_t *attr, const char *path) {
     if (attr == NULL) {
         return -1;
@@ -95,6 +208,21 @@ int mr_attr_set_log_file(mr_attr_t *attr, const char *path) {
     return 0;
 }
 
+/*
+ * mr_attr_set_hash_function - Impostazione della funzione di hashing dei
+ * token (addendum).
+ *
+ * La funzione indicata serve a partizionare in modo deterministico i
+ * token fra i thread del processo reducer: due occorrenze dello stesso
+ * token devono essere assegnate allo stesso worker. Passing NULL come
+ * hash ripristina il comportamento predefinito (mr_default_hash).
+ *
+ * attr     : attributi da modificare.
+ * hash     : funzione di hashing, oppure NULL per il default.
+ * hash_arg : argomento opzionale passato alla funzione di hashing.
+ *
+ * Ritorna 0 in caso di successo, -1 se attr e' NULL.
+ */
 int mr_attr_set_hash_function(mr_attr_t *attr, mr_hash_t hash, void *hash_arg) {
     if (attr == NULL) {
         return -1;
@@ -104,6 +232,23 @@ int mr_attr_set_hash_function(mr_attr_t *attr, mr_hash_t hash, void *hash_arg) {
     return 0;
 }
 
+/*
+ * mr_create - Creazione di una nuova istanza di elaborazione.
+ *
+ * Alloca la struttura opaca e vi copia gli attributi ricevuti: dopo il
+ * ritorno con successo il chiamante puo' distruggere o modificare il
+ * proprio mr_attr_t senza alterare l'elaborazione. Non viene eseguito
+ * alcun fork() ne' creato alcun thread: l'avvio avviene in mr_start().
+ *
+ * mr       : indirizzo in cui depositare l'handle creato.
+ * attr     : attributi di configurazione; NULL per i valori di default.
+ * mapper   : funzione mapper dell'utente (obbligatoria).
+ * reducer  : funzione reducer dell'utente (obbligatoria).
+ * user_arg : argomento opzionale inoltrato alle callback.
+ *
+ * Ritorna 0 in caso di successo, -1 se mancano i puntatori obbligatori,
+ * se gli attributi sono incoerenti o se l'allocazione fallisce.
+ */
 int mr_create(
     mr_t *mr,
     const mr_attr_t *attr,
@@ -142,6 +287,15 @@ int mr_create(
     return 0;
 }
 
+/*
+ * mr_destroy - Distruzione dell'istanza e rilascio della memoria.
+ *
+ * Deve essere chiamata solo a elaborazione conclusa: mr_start() e' infatti
+ * bloccante, quindi non vi sono strutture in uso al momento della
+ * chiamata. La funzione tollera NULL e ritorna sempre 0.
+ *
+ * mr : handle restituito da mr_create().
+ */
 int mr_destroy(mr_t mr) {
     if (mr == NULL) {
         return 0;
@@ -150,14 +304,43 @@ int mr_destroy(mr_t mr) {
     return 0;
 }
 
-/* Funzione ausiliaria di comparazione stringhe per qsort */
+/*
+ * compare_strings - Comparatore di stringhe per qsort.
+ *
+ * Utilizzato per ordinare lessicograficamente i nomi dei file di input,
+ * cosi' da rendere deterministico l'ordine di lettura richiesto dalla
+ * specifica (indipendentemente dall'ordine restituito da readdir()).
+ *
+ * Ritorna un valore negativo, nullo o positivo a seconda dell'ordine.
+ */
 static int compare_strings(const void *a, const void *b) {
     const char *str1 = *(const char **)a;
     const char *str2 = *(const char **)b;
     return strcmp(str1, str2);
 }
 
-/* Raccolta ricorsiva o piatta dei file regolari con ordinamento lessicografico */
+/*
+ * collect_regular_files - Raccolta dei file regolari contenuti in una
+ * directory, con supporto alla scansione ricorsiva (addendum).
+ *
+ * Apre la directory, ignora "." e ".." ed esamina ogni voce con stat():
+ *   - se e' una sottodirectory, la funzione viene richiamata ricorsivamente
+ *     (la scansione delle sottodirectory e' richiesta dall'addendum);
+ *   - se e' un file regolare, il percorso viene duplicato e accodato
+ *     nell'array di uscita, che viene riallocato con raddoppio della
+ *     capacita' quando risulta pieno.
+ *
+ * L'ordinamento lessicografico non viene applicato qui, ma dal chiamante
+ * dopo la raccolta completa.
+ *
+ * dir_path  : percorso della directory da esaminare.
+ * files_out : indirizzo dell'array dei percorsi (accumulo delle righe).
+ * count_out : numero di percorsi attualmente raccolti.
+ * cap_out   : capacita' corrente dell'array.
+ *
+ * Ritorna 0 in caso di successo, -1 in caso di errore di apertura della
+ * directory o di allocazione.
+ */
 static int collect_regular_files(const char *dir_path, char ***files_out, size_t *count_out, size_t *cap_out) {
     DIR *d = opendir(dir_path);
     if (d == NULL) {
@@ -204,7 +387,18 @@ static int collect_regular_files(const char *dir_path, char ***files_out, size_t
     return 0;
 }
 
-/* Comparatore deterministico per i risultati finali ordinati lessicograficamente per token */
+/*
+ * compare_results - Comparatore dei risultati finali per qsort.
+ *
+ * L'ordinamento e' lessicografico per token; a parita' di token (cioe'
+ * quando il reducer ha emesso piu' risultati per la stessa chiave) si
+ * usa l'ordine di arrivo sulla pipe come secondo criterio. Il risultato
+ * e' che, a parita' di input e di callback, il file di output e'
+ * identico fra esecuzioni diverse, pur con elaborazione concorrente e
+ * scheduling non deterministico dei thread (Sezione 8).
+ *
+ * Ritorna un valore negativo, nullo o positivo a seconda dell'ordine.
+ */
 static int compare_results(const void *a, const void *b) {
     const final_result_item_t *item1 = (const final_result_item_t *)a;
     const final_result_item_t *item2 = (const final_result_item_t *)b;
@@ -224,6 +418,35 @@ static int compare_results(const void *a, const void *b) {
     return 0;
 }
 
+/*
+ * mr_start - Avvio e completamento di un'elaborazione MapReduce.
+ *
+ * Funzione bloccante: restituisce il controllo solo quando la pipeline e'
+ * terminata correttamente oppure quando si e' verificato un errore.
+ * Le fasi sono numerate nei commenti interni e seguono l'ordine prescritto
+ * dalla Sezione 5 della specifica:
+ *
+ *    1. ispezione dell'input e raccolta dei file da elaborare;
+ *    2. creazione delle tre pipe;
+ *    3. fork() del processo mapper e collegamento delle pipe con dup2();
+ *    4. fork() del processo reducer e collegamento delle pipe con dup2();
+ *    5. invio delle righe serializzate al mapper e chiusura della pipe;
+ *    6. raccolta dei risultati serializzati provenienti dal reducer;
+ *    7. ordinamento deterministico dei risultati per token;
+ *    8. scrittura del file di output in formato a record con lunghezze;
+ *    9. attesa della terminazione dei figli con waitpid().
+ *
+ * In ogni processo vengono chiusi i descrittori non utilizzati: e' la
+ * condizione che permette la corretta propagazione dell'EOF lungo tutta
+ * la pipeline e che evita blocchi permanenti.
+ *
+ * mr          : handle dell'istanza.
+ * input_path  : file regolare o directory di input.
+ * output_path : percorso del file di output da produrre.
+ *
+ * Ritorna 0 in caso di successo, -1 in caso di errore (errno impostato
+ * dove appropriato).
+ */
 int mr_start(mr_t mr, const char *input_path, const char *output_path) {
     if (mr == NULL || input_path == NULL || output_path == NULL) {
         return -1;
