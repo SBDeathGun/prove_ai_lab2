@@ -1,0 +1,2 @@
+[2026-10-07 23:08:55.929] [main] [main] [INIZIO_ELABORAZIONE] Avvio elaborazione MapReduce (input: file_inesistente_12345.txt, output: out.mro)
+[2026-10-07 23:08:55.929] [main] [main] [ERRORE] Input path non valido: No such file or directory
